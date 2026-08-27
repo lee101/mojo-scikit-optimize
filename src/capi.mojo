@@ -1,11 +1,9 @@
 """Numerical kernels exported to Python through a small C ABI."""
 
-from std.algorithm import parallelize
 from std.math import erf, exp, sqrt
 from std.sys.info import simd_width_of
 
 comptime W = simd_width_of[DType.float64]()
-comptime FOREST_PARALLEL_MIN_SAMPLES = 1024
 comptime FOREST_PARALLEL_CHUNK = 64
 comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime FPtr = UnsafePointer[Float32, AnyOrigin[mut=True]]
@@ -206,7 +204,7 @@ def forest_predict(
     n_trees: Int,
     min_variance: Float64,
 ):
-    @parameter
+    @__parameter
     def predict_chunk(chunk: Int):
         var begin = chunk * FOREST_PARALLEL_CHUNK
         var end = min(begin + FOREST_PARALLEL_CHUNK, n_samples)
@@ -233,11 +231,8 @@ def forest_predict(
             std_dst[sample] = sqrt(variance) if variance > 0.0 else 0.0
 
     var chunks = (n_samples + FOREST_PARALLEL_CHUNK - 1) // FOREST_PARALLEL_CHUNK
-    if n_samples >= FOREST_PARALLEL_MIN_SAMPLES:
-        parallelize[predict_chunk](chunks, 16)
-    else:
-        for chunk in range(chunks):
-            predict_chunk(chunk)
+    for chunk in range(chunks):
+        predict_chunk(chunk)
 
 
 @export("msko_covariance")
