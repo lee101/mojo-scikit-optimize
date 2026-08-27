@@ -217,7 +217,9 @@ class GaussianProcessRegressor(RegressorMixin, BaseEstimator):
             return empty
         mean = np.empty(len(X), dtype=np.float64)
         std = np.empty(len(X), dtype=np.float64)
-        work = np.empty((len(X), len(self.X_train_)), dtype=np.float64)
+        parallel = len(X) >= 128 and len(X) * len(self.X_train_) >= 32_768
+        work_rows = min(len(X), 16) if parallel else 1
+        work = np.empty((work_rows, len(self.X_train_)), dtype=np.float64)
         lib().msko_gp_predict(
             addr(self.X_train_),
             addr(X),

@@ -1,10 +1,16 @@
 """Numerical kernels exported to Python through a small C ABI."""
 
+from max.algorithm import parallelize
 from std.math import erf, exp, sqrt
 from std.sys.info import simd_width_of
 
 comptime W = simd_width_of[DType.float64]()
+comptime COVARIANCE_PARALLEL_MIN_VALUES = 131_072
+comptime GP_PARALLEL_MIN_QUERIES = 128
+comptime GP_PARALLEL_MIN_VALUES = 32_768
+comptime FOREST_PARALLEL_MIN_SAMPLES = 1024
 comptime FOREST_PARALLEL_CHUNK = 64
+comptime MAX_WORKERS = 16
 comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime FPtr = UnsafePointer[Float32, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
@@ -64,11 +70,18 @@ def covariance_matrix(
     amplitude: Float64,
     kind: Int,
 ):
-    for i in range(n):
+    @__parameter
+    def covariance_row(i: Int):
         for j in range(m):
             dst[i * m + j] = covariance_value(
                 x + i * d, y + j * d, length_scale, d, amplitude, kind
             )
+
+    if n * m >= COVARIANCE_PARALLEL_MIN_VALUES:
+        parallelize[covariance_row](n, min(n, MAX_WORKERS))
+    else:
+        for i in range(n):
+            covariance_row(i)
 
 
 def cholesky(a: Ptr, n: Int) -> Bool:
@@ -135,8 +148,8 @@ def gp_predict(
     amplitude: Float64,
     kind: Int,
 ):
-    for q in range(m):
-        var row = work + q * n
+    @__parameter
+    def predict_one(q: Int, row: Ptr):
         var mean = 0.0
         for i in range(n):
             var kval = covariance_value(
@@ -148,12 +161,40 @@ def gp_predict(
         var variance = amplitude
         for i in range(n):
             var value = row[i]
-            for j in range(i):
+            var acc = SIMD[DType.float64, W](0.0)
+            var j = 0
+            while j + W <= i:
+                acc += (
+                    (l + i * n).load[width=W](j)
+                    * row.load[width=W](j)
+                )
+                j += W
+            value -= acc.reduce_add()
+            while j < i:
                 value -= l[i * n + j] * row[j]
+                j += 1
             value /= l[i * n + i]
             row[i] = value
             variance -= value * value
         std_dst[q] = sqrt(variance) if variance > 0.0 else 0.0
+
+    var workers = 1
+    if m >= GP_PARALLEL_MIN_QUERIES and n * m >= GP_PARALLEL_MIN_VALUES:
+        workers = min(m, MAX_WORKERS)
+
+    @__parameter
+    def predict_chunk(worker: Int):
+        var begin = worker * m // workers
+        var end = (worker + 1) * m // workers
+        var row = work + worker * n
+        for q in range(begin, end):
+            predict_one(q, row)
+
+    if workers > 1:
+        parallelize[predict_chunk](workers, workers)
+    else:
+        for q in range(m):
+            predict_one(q, work)
 
 
 def normal_cdf(x: Float64) -> Float64:
@@ -231,8 +272,11 @@ def forest_predict(
             std_dst[sample] = sqrt(variance) if variance > 0.0 else 0.0
 
     var chunks = (n_samples + FOREST_PARALLEL_CHUNK - 1) // FOREST_PARALLEL_CHUNK
-    for chunk in range(chunks):
-        predict_chunk(chunk)
+    if n_samples >= FOREST_PARALLEL_MIN_SAMPLES:
+        parallelize[predict_chunk](chunks, min(chunks, MAX_WORKERS))
+    else:
+        for chunk in range(chunks):
+            predict_chunk(chunk)
 
 
 @export("msko_covariance")

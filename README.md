@@ -43,8 +43,9 @@ The table lists the upstream-shaped surface exercised by the parity suite.
 
 The public call signatures of the three minimizers, `Optimizer`, and the
 Gaussian expected-improvement function match scikit-optimize 0.10.2. Tests also
-exercise non-SIMD-width Cholesky tails, the forest serial/parallel boundary,
-invalid and empty FFI inputs, and unsupported kernel rejection.
+exercise non-SIMD-width Cholesky and GP prediction tails, covariance, GP, and
+forest serial/parallel boundaries, invalid and empty FFI inputs, and unsupported
+kernel rejection.
 
 Not covered are MES/PVRS and per-second acquisition functions, BayesSearchCV,
 plotting, the full callback collection, low-discrepancy initial generators,
@@ -78,24 +79,30 @@ entry point because its Pixi task takes a machine-wide lock.
 
 ## Performance
 
-Measured on this machine on 2026-07-29 with `pixi run bench`: Intel Xeon
+Measured on this machine on 2026-08-27 with `pixi run bench`: Intel Xeon
 E5-2697 v4, Linux x86_64. Times are the best of three warm runs.
 
 | case | mojo-scikit-optimize | scikit-optimize | result |
 | --- | ---: | ---: | ---: |
-| Matérn covariance (3000 x 500 x 8) | 67.23 ms | 115.07 ms | 1.71x faster |
-| Expected improvement (2M) | 75.89 ms | 304.07 ms | 4.01x faster |
-| GP.fit (650 x 6) | 36.68 ms | 89.77 ms | 2.45x faster |
-| GP.predict mean+std (160 train, 20k query) | 468.63 ms | 1299.83 ms | 2.77x faster |
-| ExtraTrees.predict mean+std (100 trees, 100k) | 871.53 ms | 7971.65 ms | 9.15x faster |
+| Matérn covariance (3000 x 500 x 8) | 12.26 ms | 389.51 ms | 31.78x faster |
+| Expected improvement (2M) | 73.99 ms | 1310.47 ms | 17.71x faster |
+| GP.fit (650 x 6) | 34.41 ms | 88.24 ms | 2.56x faster |
+| GP.predict mean+std (160 train, 20k query) | 29.88 ms | 1344.39 ms | 45.00x faster |
+| ExtraTrees.predict mean+std (100 trees, 100k) | 582.10 ms | 7100.57 ms | 12.20x faster |
 
 GP fitting uses hardware-width float64 SIMD for Cholesky dot products and the
-forward solve, including scalar remainder loops. Forest prediction stays serial
-below 1,024 samples; larger batches use 64-sample tasks on a capped 16-worker
-pool. Its scikit-learn-compatible float32 feature buffer now crosses the FFI
-directly instead of being copied back to float64.
+forward solve, including scalar remainder loops. Large covariance matrices and
+GP query batches use a capped 16-worker pool; smaller calls stay serial. GP
+prediction reuses one scratch row per worker instead of allocating one per
+query. Forest prediction stays serial below 1,024 samples; larger batches use
+64-sample tasks on the same capped pool. Its scikit-learn-compatible float32
+feature buffer crosses the FFI directly instead of being copied back to
+float64.
 
-No GPU path or GPU performance claim is included.
+No GPU path or GPU performance claim is included. Covariance distance work,
+triangular solves, and branch-heavy forest traversal do not exceed the roughly
+two-flops-per-byte threshold once their input loads are counted, so PCIe copies
+and launch overhead would not be justified.
 
 ## How it works
 

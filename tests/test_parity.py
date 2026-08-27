@@ -66,6 +66,20 @@ def test_covariance_kernel_parity(kernel, kind):
     assert np.allclose(result, 1.7 * kernel(X, Y), rtol=2e-11, atol=2e-13)
 
 
+def test_covariance_serial_and_parallel_threshold_parity():
+    rng = np.random.RandomState(21)
+    X = f64(rng.normal(size=(256, 3)))
+    scale = f64([0.4, 0.7, 1.2])
+    kernel = Matern(scale, nu=2.5)
+    for size in (511, 512):
+        Y = f64(rng.normal(size=(size, 3)))
+        result = np.empty((len(X), len(Y)))
+        lib().msko_covariance(
+            addr(X), addr(Y), addr(result), len(X), len(Y), 3, addr(scale), 1.0, 3
+        )
+        assert np.allclose(result, kernel(X, Y), rtol=2e-11, atol=2e-13)
+
+
 def test_simd_cholesky_and_solve_tail():
     rng = np.random.RandomState(12)
     raw = rng.normal(size=(13, 13))
@@ -79,6 +93,22 @@ def test_simd_cholesky_and_solve_tail():
     expected_solution = np.linalg.solve(matrix, rhs)
     lib().msko_cholesky_solve(addr(factor), addr(rhs), len(rhs))
     assert np.allclose(rhs, expected_solution, rtol=2e-12, atol=2e-12)
+
+
+def test_gp_prediction_simd_tail_and_parallel_threshold_parity():
+    rng = np.random.RandomState(22)
+    X = rng.uniform(-1, 1, (257, 3))
+    y = np.sin(3 * X[:, 0]) + X[:, 1] - X[:, 2] ** 2
+    Q = rng.uniform(-1, 1, (128, 3))
+    kernel = ConstantKernel(1.1) * Matern([0.4, 0.7, 1.0], nu=2.5)
+    kwargs = dict(kernel=kernel, optimizer=None, alpha=1e-6, normalize_y=True)
+    ours = GaussianProcessRegressor(**kwargs).fit(X, y)
+    theirs = SkGaussianProcessRegressor(**kwargs).fit(X, y)
+    for size in (127, 128):
+        mean, std = ours.predict(Q[:size], return_std=True)
+        expected_mean, expected_std = theirs.predict(Q[:size], return_std=True)
+        assert np.allclose(mean, expected_mean, rtol=2e-10, atol=2e-10)
+        assert np.allclose(std, expected_std, rtol=2e-10, atol=2e-10)
 
 
 @pytest.mark.parametrize(
