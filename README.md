@@ -44,7 +44,7 @@ The table lists the upstream-shaped surface exercised by the parity suite.
 The public call signatures of the three minimizers, `Optimizer`, and the
 Gaussian expected-improvement function match scikit-optimize 0.10.2. Tests also
 exercise non-SIMD-width Cholesky and GP prediction tails, covariance, GP, and
-forest serial/parallel boundaries, invalid and empty FFI inputs, and unsupported
+forest batch sizes, invalid and empty FFI inputs, and unsupported
 kernel rejection.
 
 Not covered are MES/PVRS and per-second acquisition functions, BayesSearchCV,
@@ -91,11 +91,17 @@ E5-2697 v4, Linux x86_64. Times are the best of three warm runs.
 | ExtraTrees.predict mean+std (100 trees, 100k) | 582.10 ms | 7100.57 ms | 12.20x faster |
 
 GP fitting uses hardware-width float64 SIMD for Cholesky dot products and the
-forward solve, including scalar remainder loops. Large covariance matrices and
-GP query batches use a capped 16-worker pool; smaller calls stay serial. GP
-prediction reuses one scratch row per worker instead of allocating one per
-query. Forest prediction stays serial below 1,024 samples; larger batches use
-64-sample tasks on the same capped pool. Its scikit-learn-compatible float32
+forward solve, including scalar remainder loops. Every kernel is single-threaded:
+Mojo 1.2 removed closure capture, so a state-carrying kernel can no longer be
+fanned out from inside a `parallelize` body. Each kernel was re-checked against
+its arithmetic intensity instead. GP covariance reaches roughly two flops per
+byte, right at the break-even point, and a measurement on this machine (3.2M to
+13M covariance pairs, 2 and 4 threads) returned 2.1x to 2.5x at the very top of
+that range but a loss at the 160k-pair sizes a Gaussian-process surrogate
+actually runs at, so the kernel stays serial. The GP triangular solve runs at
+about 0.25 flops per byte and forest traversal at about 0.09, both clearly
+memory-bound. GP prediction reuses one scratch row for the whole query batch
+instead of allocating one per query. Its scikit-learn-compatible float32
 feature buffer crosses the FFI directly instead of being copied back to
 float64.
 

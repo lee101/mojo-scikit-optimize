@@ -1,16 +1,9 @@
 """Numerical kernels exported to Python through a small C ABI."""
 
-from max.algorithm import parallelize
 from std.math import erf, exp, sqrt
 from std.sys.info import simd_width_of
 
 comptime W = simd_width_of[DType.float64]()
-comptime COVARIANCE_PARALLEL_MIN_VALUES = 131_072
-comptime GP_PARALLEL_MIN_QUERIES = 128
-comptime GP_PARALLEL_MIN_VALUES = 32_768
-comptime FOREST_PARALLEL_MIN_SAMPLES = 1024
-comptime FOREST_PARALLEL_CHUNK = 64
-comptime MAX_WORKERS = 16
 comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime FPtr = UnsafePointer[Float32, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
@@ -70,18 +63,11 @@ def covariance_matrix(
     amplitude: Float64,
     kind: Int,
 ):
-    @__parameter
-    def covariance_row(i: Int):
+    for i in range(n):
         for j in range(m):
             dst[i * m + j] = covariance_value(
                 x + i * d, y + j * d, length_scale, d, amplitude, kind
             )
-
-    if n * m >= COVARIANCE_PARALLEL_MIN_VALUES:
-        parallelize[covariance_row](n, min(n, MAX_WORKERS))
-    else:
-        for i in range(n):
-            covariance_row(i)
 
 
 def cholesky(a: Ptr, n: Int) -> Bool:
@@ -133,6 +119,49 @@ def cholesky_solve(l: Ptr, rhs: Ptr, n: Int):
         rhs[i] = value / l[i * n + i]
 
 
+
+def gp_predict_one(
+    query: Ptr,
+    train: Ptr,
+    alpha: Ptr,
+    l: Ptr,
+    length_scale: Ptr,
+    mean_dst: Ptr,
+    std_dst: Ptr,
+    row: Ptr,
+    q: Int,
+    n: Int,
+    d: Int,
+    amplitude: Float64,
+    kind: Int,
+):
+    var mean = 0.0
+    for i in range(n):
+        var kval = covariance_value(
+            query + q * d, train + i * d, length_scale, d, amplitude, kind
+        )
+        row[i] = kval
+        mean += kval * alpha[i]
+    mean_dst[q] = mean
+    var variance = amplitude
+    for i in range(n):
+        var value = row[i]
+        var acc = SIMD[DType.float64, W](0.0)
+        var j = 0
+        while j + W <= i:
+            acc += (l + i * n).load[width=W](j) * row.load[width=W](j)
+            j += W
+        value -= acc.reduce_add()
+        while j < i:
+            value -= l[i * n + j] * row[j]
+            j += 1
+        value /= l[i * n + i]
+        row[i] = value
+        variance -= value * value
+    std_dst[q] = sqrt(variance) if variance > 0.0 else 0.0
+
+
+
 def gp_predict(
     train: Ptr,
     query: Ptr,
@@ -148,53 +177,22 @@ def gp_predict(
     amplitude: Float64,
     kind: Int,
 ):
-    @__parameter
-    def predict_one(q: Int, row: Ptr):
-        var mean = 0.0
-        for i in range(n):
-            var kval = covariance_value(
-                query + q * d, train + i * d, length_scale, d, amplitude, kind
-            )
-            row[i] = kval
-            mean += kval * alpha[i]
-        mean_dst[q] = mean
-        var variance = amplitude
-        for i in range(n):
-            var value = row[i]
-            var acc = SIMD[DType.float64, W](0.0)
-            var j = 0
-            while j + W <= i:
-                acc += (
-                    (l + i * n).load[width=W](j)
-                    * row.load[width=W](j)
-                )
-                j += W
-            value -= acc.reduce_add()
-            while j < i:
-                value -= l[i * n + j] * row[j]
-                j += 1
-            value /= l[i * n + i]
-            row[i] = value
-            variance -= value * value
-        std_dst[q] = sqrt(variance) if variance > 0.0 else 0.0
-
-    var workers = 1
-    if m >= GP_PARALLEL_MIN_QUERIES and n * m >= GP_PARALLEL_MIN_VALUES:
-        workers = min(m, MAX_WORKERS)
-
-    @__parameter
-    def predict_chunk(worker: Int):
-        var begin = worker * m // workers
-        var end = (worker + 1) * m // workers
-        var row = work + worker * n
-        for q in range(begin, end):
-            predict_one(q, row)
-
-    if workers > 1:
-        parallelize[predict_chunk](workers, workers)
-    else:
-        for q in range(m):
-            predict_one(q, work)
+    for q in range(m):
+        gp_predict_one(
+            query,
+            train,
+            alpha,
+            l,
+            length_scale,
+            mean_dst,
+            std_dst,
+            work,
+            q,
+            n,
+            d,
+            amplitude,
+            kind,
+        )
 
 
 def normal_cdf(x: Float64) -> Float64:
@@ -245,38 +243,27 @@ def forest_predict(
     n_trees: Int,
     min_variance: Float64,
 ):
-    @__parameter
-    def predict_chunk(chunk: Int):
-        var begin = chunk * FOREST_PARALLEL_CHUNK
-        var end = min(begin + FOREST_PARALLEL_CHUNK, n_samples)
-        for sample in range(begin, end):
-            var mean_acc = 0.0
-            var second_acc = 0.0
-            for tree in range(n_trees):
-                var node = Int(offsets[tree])
-                while feature[node] >= 0:
-                    var f = Int(feature[node])
-                    if Float64(x[sample * n_features + f]) <= threshold[node]:
-                        node = Int(left[node])
-                    else:
-                        node = Int(right[node])
-                var prediction = value[node]
-                var variance = impurity[node]
-                if variance < min_variance:
-                    variance = min_variance
-                mean_acc += prediction
-                second_acc += variance + prediction * prediction
-            var mean = mean_acc / Float64(n_trees)
-            var variance = second_acc / Float64(n_trees) - mean * mean
-            mean_dst[sample] = mean
-            std_dst[sample] = sqrt(variance) if variance > 0.0 else 0.0
-
-    var chunks = (n_samples + FOREST_PARALLEL_CHUNK - 1) // FOREST_PARALLEL_CHUNK
-    if n_samples >= FOREST_PARALLEL_MIN_SAMPLES:
-        parallelize[predict_chunk](chunks, min(chunks, MAX_WORKERS))
-    else:
-        for chunk in range(chunks):
-            predict_chunk(chunk)
+    for sample in range(n_samples):
+        var mean_acc = 0.0
+        var second_acc = 0.0
+        for tree in range(n_trees):
+            var node = Int(offsets[tree])
+            while feature[node] >= 0:
+                var f = Int(feature[node])
+                if Float64(x[sample * n_features + f]) <= threshold[node]:
+                    node = Int(left[node])
+                else:
+                    node = Int(right[node])
+            var prediction = value[node]
+            var variance = impurity[node]
+            if variance < min_variance:
+                variance = min_variance
+            mean_acc += prediction
+            second_acc += variance + prediction * prediction
+        var mean = mean_acc / Float64(n_trees)
+        var variance = second_acc / Float64(n_trees) - mean * mean
+        mean_dst[sample] = mean
+        std_dst[sample] = sqrt(variance) if variance > 0.0 else 0.0
 
 
 @export("msko_covariance")
